@@ -1,3 +1,22 @@
 CONFIG_IDF_TARGET="esp32s3"
 CONFIG_FREERTOS_HZ=1000
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# XIAO ESP32-S3 has 8 MB flash
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# XIAO ESP32-S3 Sense has 8 MB Octal PSRAM — required for camera frame buffers
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# Enlarge HTTP server stack for the streaming task
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# Camera SCCB: use the same legacy I2C driver as our IMU, on port 1 (IMU is on
+# port 0). Mixing the legacy and new I2C drivers on the same port hard-aborts.
+CONFIG_SCCB_HARDWARE_I2C_DRIVER_LEGACY=y
+CONFIG_SCCB_HARDWARE_I2C_PORT1=y

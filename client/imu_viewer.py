@@ -110,6 +110,92 @@ def _combine_meshes(*parts):
     return np.vstack(vs), np.vstack(fs), np.vstack(cs)
 
 
+class VideoReceiver(QtCore.QObject):
+    """Pulls MJPEG from `http://<esp_ip>/stream` and emits decoded QImage frames."""
+
+    frame = QtCore.Signal(QtGui.QImage)
+
+    def __init__(self, esp_ip):
+        super().__init__()
+        self._url = f"http://{esp_ip}:81/stream"
+        self._stop = threading.Event()
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                with requests.get(self._url, stream=True, timeout=5) as r:
+                    if not r.ok:
+                        print(f"video → {r.status_code}", file=sys.stderr)
+                        self._stop.wait(2)
+                        continue
+                    boundary = self._extract_boundary(r.headers.get("Content-Type", ""))
+                    if not boundary:
+                        print(f"video: no boundary in Content-Type", file=sys.stderr)
+                        self._stop.wait(2)
+                        continue
+                    self._parse_mjpeg(r.iter_content(chunk_size=8192), boundary)
+            except requests.RequestException as e:
+                print(f"video error: {e}", file=sys.stderr)
+                self._stop.wait(2)
+
+    @staticmethod
+    def _extract_boundary(content_type):
+        for part in content_type.split(";"):
+            part = part.strip()
+            if part.startswith("boundary="):
+                return part.split("=", 1)[1].strip()
+        return None
+
+    def _parse_mjpeg(self, chunks, boundary):
+        sep = ("--" + boundary).encode()
+        buf = b""
+        for chunk in chunks:
+            if self._stop.is_set():
+                return
+            if not chunk:
+                continue
+            buf += chunk
+            while True:
+                idx = buf.find(sep)
+                if idx < 0:
+                    break
+                hdr_end = buf.find(b"\r\n\r\n", idx)
+                if hdr_end < 0:
+                    break
+                clen = self._parse_content_length(buf[idx:hdr_end])
+                if clen is None:
+                    buf = buf[hdr_end + 4:]
+                    continue
+                body_start = hdr_end + 4
+                if len(buf) < body_start + clen:
+                    break  # need more data
+                jpeg_bytes = buf[body_start:body_start + clen]
+                buf = buf[body_start + clen:]
+                img = QtGui.QImage.fromData(jpeg_bytes)
+                if not img.isNull():
+                    self.frame.emit(img)
+
+    @staticmethod
+    def _parse_content_length(headers_bytes):
+        try:
+            text = headers_bytes.decode(errors="ignore")
+        except Exception:
+            return None
+        for line in text.split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                try:
+                    return int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    return None
+        return None
+
+
 class Receiver(QtCore.QObject):
     quat = QtCore.Signal(float, float, float, float)
 
@@ -159,14 +245,27 @@ class Receiver(QtCore.QObject):
 
 class Viewer(QtWidgets.QMainWindow):
 
+    INSET_SIZE = 280
+    INSET_MARGIN = 16
+
     def __init__(self, esp_ip, port=0):
         super().__init__()
-        self.setWindowTitle(f"ICM-20948 viewer — {esp_ip}")
-        self.resize(960, 720)
+        self.setWindowTitle(f"Drone viewer — {esp_ip}")
+        self.resize(1024, 768)
 
-        self._gl = gl.GLViewWidget()
-        self.setCentralWidget(self._gl)
-        self._gl.setCameraPosition(distance=4, elevation=25, azimuth=45)
+        # Central video display
+        self._video = QtWidgets.QLabel("waiting for video…")
+        self._video.setAlignment(QtCore.Qt.AlignCenter)
+        self._video.setStyleSheet(
+            "background-color: #000; color: #888; font-family: monospace;"
+        )
+        self.setCentralWidget(self._video)
+
+        # 3D inset (parented to the video label so it floats over it)
+        self._gl = gl.GLViewWidget(self._video)
+        self._gl.setCameraPosition(distance=3.5, elevation=25, azimuth=45)
+        self._gl.resize(self.INSET_SIZE, self.INSET_SIZE)
+        self._gl.setStyleSheet("border: 1px solid rgba(255,255,255,80);")
 
         grid = gl.GLGridItem()
         grid.setSize(4, 4)
@@ -188,10 +287,55 @@ class Viewer(QtWidgets.QMainWindow):
         self._rx.start()
         print(f"listening on UDP port {self._rx.port}, subscribing to {esp_ip}")
 
+        self._video_rx = VideoReceiver(esp_ip)
+        self._video_rx.frame.connect(self._on_video_frame)
+        self._video_rx.start()
+        print(f"video stream: http://{esp_ip}/stream")
+
         self._frames = 0
         self._last_t = time.monotonic()
         self._last_quat = (1.0, 0.0, 0.0, 0.0)
         self._tare = None  # set to a quaternion to enable tare
+        self._last_video_pixmap = None
+        self._video_frames = 0
+        self._last_video_t = time.monotonic()
+        self._video_fps = 0.0
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._reposition_inset()
+        if self._last_video_pixmap is not None:
+            self._refresh_video_pixmap()
+
+    def _reposition_inset(self):
+        if self._video.width() == 0 or self._video.height() == 0:
+            return
+        x = self._video.width()  - self._gl.width()  - self.INSET_MARGIN
+        y = self._video.height() - self._gl.height() - self.INSET_MARGIN
+        self._gl.move(x, y)
+        self._gl.raise_()
+
+    def _refresh_video_pixmap(self):
+        if self._last_video_pixmap is None:
+            return
+        scaled = self._last_video_pixmap.scaled(
+            self._video.size(),
+            QtCore.Qt.KeepAspectRatio,
+            QtCore.Qt.SmoothTransformation,
+        )
+        self._video.setPixmap(scaled)
+        self._reposition_inset()
+
+    @QtCore.Slot(QtGui.QImage)
+    def _on_video_frame(self, img):
+        self._last_video_pixmap = QtGui.QPixmap.fromImage(img)
+        self._refresh_video_pixmap()
+        self._video_frames += 1
+        now = time.monotonic()
+        if now - self._last_video_t >= 1.0:
+            self._video_fps = self._video_frames / (now - self._last_video_t)
+            self._video_frames = 0
+            self._last_video_t = now
 
     @staticmethod
     def _make_drone():
@@ -247,7 +391,8 @@ class Viewer(QtWidgets.QMainWindow):
             fps = self._frames / (now - self._last_t)
             tare = "tared" if self._tare is not None else "raw"
             self._status.showMessage(
-                f"{fps:.1f} Hz [{tare}]   "
+                f"orientation {fps:.1f} Hz [{tare}]   "
+                f"video {self._video_fps:.1f} fps   "
                 f"q=[w={dw:+.4f} x={dx:+.4f} y={dy:+.4f} z={dz:+.4f}]   "
                 f"(T = tare, R = reset)"
             )
@@ -264,6 +409,7 @@ class Viewer(QtWidgets.QMainWindow):
 
     def closeEvent(self, ev):
         self._rx.stop()
+        self._video_rx.stop()
         super().closeEvent(ev)
 
 

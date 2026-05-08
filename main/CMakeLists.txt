@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "wifi_sta.c"
         "udp_push.c"
+        "camera_stream.c"
     INCLUDE_DIRS "."
     REQUIRES
         driver
@@ -15,4 +16,5 @@ idf_component_register(
         json
         lwip
         icm20948
+        espressif__esp32-camera
 )

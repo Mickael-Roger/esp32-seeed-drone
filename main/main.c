@@ -12,6 +12,7 @@
 #include "icm20948.h"
 #include "icm20948_i2c.h"
 
+#include "camera_stream.h"
 #include "udp_push.h"
 #include "wifi_sta.h"
 
@@ -156,9 +157,13 @@ void app_main(void)
     ESP_ERROR_CHECK(wifi_sta_start());
     ESP_ERROR_CHECK(udp_push_start());
 
+    ESP_ERROR_CHECK(camera_stream_init());
+    ESP_ERROR_CHECK(camera_stream_start_server(81));
+
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     esp_netif_ip_info_t ip;
     ESP_ERROR_CHECK(esp_netif_get_ip_info(netif, &ip));
-    printf("Subscribe at: POST http://" IPSTR "/subscribe  body: {\"port\":N}\n",
+    printf("Orientation: POST http://" IPSTR "/subscribe  {\"port\":N}\n",
            IP2STR(&ip.ip));
+    printf("Video:       GET  http://" IPSTR ":81/stream\n", IP2STR(&ip.ip));
 }

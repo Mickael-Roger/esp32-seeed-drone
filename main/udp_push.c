@@ -140,6 +140,11 @@ esp_err_t udp_push_start(void)
     return ESP_OK;
 }
 
+httpd_handle_t udp_push_get_httpd(void)
+{
+    return s_httpd;
+}
+
 void udp_push_send_quat(float w, float x, float y, float z)
 {
     if (s_udp_sock < 0) return;
