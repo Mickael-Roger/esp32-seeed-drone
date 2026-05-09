@@ -234,6 +234,7 @@ class FlightController:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._pressed = set()
         self._pulse_flags = 0
+        self._auto_descend = False
         self._lock = threading.Lock()
         self._stop = threading.Event()
 
@@ -263,16 +264,27 @@ class FlightController:
         with self._lock:
             self._pulse_flags |= self.FLAG_EMERGENCY_STOP
 
+    def toggle_auto_descend(self):
+        """Toggle a continuous 'down throttle' that doesn't need a key held."""
+        with self._lock:
+            self._auto_descend = not self._auto_descend
+
+    def cancel_auto_descend(self):
+        with self._lock:
+            self._auto_descend = False
+
     def state(self):
         with self._lock:
             pressed = set(self._pressed)
+            auto_descend = self._auto_descend
         pitch = roll = throttle = yaw = FC_NEUTRAL
         if "forward" in pressed: pitch    = FC_FULL_HIGH
         if "back"    in pressed: pitch    = FC_FULL_LOW
         if "right"   in pressed: roll     = FC_FULL_HIGH
         if "left"    in pressed: roll     = FC_FULL_LOW
         if "up"      in pressed: throttle = FC_FULL_HIGH
-        if "down"    in pressed: throttle = FC_FULL_LOW
+        elif "down"  in pressed or auto_descend:
+                                 throttle = FC_FULL_LOW
         if "turn"    in pressed: yaw      = FC_FULL_HIGH
         return pitch, roll, throttle, yaw
 
@@ -414,7 +426,7 @@ class Viewer(QtWidgets.QMainWindow):
     @staticmethod
     def _keymap_legend():
         return ("↑↓ pitch   ←→ roll   U/D throttle   A yaw   "
-                "S takeoff   E e-stop   T tare   R reset")
+                "S takeoff   L auto-descend   E e-stop   T tare   R reset")
 
     def __init__(self, cfg):
         super().__init__()
@@ -573,12 +585,16 @@ class Viewer(QtWidgets.QMainWindow):
         axis = self.KEY_AXIS.get(ev.key())
         if axis is not None:
             if not ev.isAutoRepeat():
+                # Manual throttle input cancels the auto-descend latch.
+                if axis in ("up", "down"):
+                    self._fc.cancel_auto_descend()
                 self._fc.press(axis)
             return
         if ev.isAutoRepeat():
             return
         k = ev.key()
         if   k == QtCore.Qt.Key_S: self._fc.takeoff()
+        elif k == QtCore.Qt.Key_L: self._fc.toggle_auto_descend()
         elif k == QtCore.Qt.Key_E: self._fc.emergency_stop()
         elif k == QtCore.Qt.Key_T: self._tare = self._last_quat
         elif k == QtCore.Qt.Key_R: self._tare = None

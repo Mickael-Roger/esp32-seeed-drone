@@ -83,6 +83,11 @@ Momentary commands (single-packet pulse):
 - **S** — takeoff (sets the `fast_fly` bit on the next outgoing packet)
 - **E** — emergency stop (sets the `emergency_stop` bit — kills motors)
 
+Latched commands (toggle on/off):
+- **L** — auto-descend: keeps the throttle pinned low without holding **D**.
+  Press again to stop, or press **U** / **D** to take manual control (which
+  cancels the latch).
+
 The script subscribes to the ESP32 (`POST /subscribe`) every 2 s; subscriptions expire after 5 s on the ESP32 side, so a crashed client stops getting packets automatically.
 
 ---
