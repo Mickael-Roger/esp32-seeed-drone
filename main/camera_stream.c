@@ -1,10 +1,18 @@
 #include "camera_stream.h"
 
-#include <stdio.h>
+#include <errno.h>
 #include <string.h>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 #include "esp_camera.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "wifi_credentials.h"
 
 static const char *TAG = "camera";
 
@@ -26,9 +34,11 @@ static const char *TAG = "camera";
 #define CAM_PIN_HREF   47
 #define CAM_PIN_PCLK   13
 
-#define BOUNDARY      "frame"
-#define STREAM_TYPE   "multipart/x-mixed-replace; boundary=" BOUNDARY
-#define PART_HEADER   "\r\n--" BOUNDARY "\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n"
+#define MAX_PAYLOAD    1400          // < typical WiFi MTU minus IP+UDP headers
+#define HEADER_SIZE    8             // u32 frame_id, u16 idx, u16 total
+
+static int                s_sock = -1;
+static struct sockaddr_in s_dst;
 
 esp_err_t camera_stream_init(void)
 {
@@ -54,7 +64,7 @@ esp_err_t camera_stream_init(void)
         .ledc_channel  = LEDC_CHANNEL_0,
         .pixel_format  = PIXFORMAT_JPEG,
         .frame_size    = FRAMESIZE_VGA,    // 640x480
-        .jpeg_quality  = 12,                // 0 (best) – 63 (worst)
+        .jpeg_quality  = 12,
         .fb_count      = 2,
         .fb_location   = CAMERA_FB_IN_PSRAM,
         .grab_mode     = CAMERA_GRAB_LATEST,
@@ -69,58 +79,70 @@ esp_err_t camera_stream_init(void)
     return ESP_OK;
 }
 
-static esp_err_t stream_handler(httpd_req_t *req)
+static void send_jpeg(const uint8_t *jpeg, size_t len)
 {
-    esp_err_t err = httpd_resp_set_type(req, STREAM_TYPE);
-    if (err != ESP_OK) return err;
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    static uint32_t frame_id = 0;
+    frame_id++;
 
-    char header[80];
-    while (true) {
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb) {
-            ESP_LOGW(TAG, "camera_fb_get returned NULL");
-            return ESP_FAIL;
-        }
+    uint16_t total = (uint16_t)((len + MAX_PAYLOAD - 1) / MAX_PAYLOAD);
+    if (total == 0) return;
 
-        int hlen = snprintf(header, sizeof(header), PART_HEADER, (unsigned)fb->len);
-        err = httpd_resp_send_chunk(req, header, hlen);
-        if (err == ESP_OK) {
-            err = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
-        }
-        esp_camera_fb_return(fb);
+    uint8_t pkt[HEADER_SIZE + MAX_PAYLOAD];
 
-        if (err != ESP_OK) {
-            // Client disconnected
-            return ESP_OK;
+    for (uint16_t idx = 0; idx < total; idx++) {
+        size_t off   = (size_t)idx * MAX_PAYLOAD;
+        size_t chunk = (len - off > MAX_PAYLOAD) ? MAX_PAYLOAD : (len - off);
+
+        memcpy(pkt + 0, &frame_id, sizeof(frame_id));
+        memcpy(pkt + 4, &idx,      sizeof(idx));
+        memcpy(pkt + 6, &total,    sizeof(total));
+        memcpy(pkt + HEADER_SIZE, jpeg + off, chunk);
+
+        if (sendto(s_sock, pkt, HEADER_SIZE + chunk, 0,
+                   (struct sockaddr *)&s_dst, sizeof(s_dst)) < 0) {
+            // WiFi TX queue full or client gone — drop the rest of this
+            // frame; the next frame is ~50 ms away.
+            return;
         }
     }
 }
 
-static const httpd_uri_t stream_uri = {
-    .uri     = "/stream",
-    .method  = HTTP_GET,
-    .handler = stream_handler,
-};
-
-static httpd_handle_t s_stream_server;
-
-esp_err_t camera_stream_start_server(uint16_t port)
+static void stream_task(void *arg)
 {
-    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.server_port = port;
-    cfg.ctrl_port  = port + 1024;  // separate internal control socket
+    while (1) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) {
+            ESP_LOGW(TAG, "camera_fb_get returned NULL");
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        send_jpeg(fb->buf, fb->len);
+        esp_camera_fb_return(fb);
+    }
+}
 
-    esp_err_t err = httpd_start(&s_stream_server, &cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "httpd_start (stream) failed: %s", esp_err_to_name(err));
-        return err;
+esp_err_t camera_stream_start(void)
+{
+    s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s_sock < 0) {
+        ESP_LOGE(TAG, "socket: errno %d", errno);
+        return ESP_FAIL;
     }
-    err = httpd_register_uri_handler(s_stream_server, &stream_uri);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "register /stream failed: %s", esp_err_to_name(err));
-        return err;
+
+    memset(&s_dst, 0, sizeof(s_dst));
+    s_dst.sin_family = AF_INET;
+    s_dst.sin_port   = htons(VIDEO_PORT);
+    if (inet_pton(AF_INET, CLIENT_IP, &s_dst.sin_addr) != 1) {
+        ESP_LOGE(TAG, "bad CLIENT_IP '%s'", CLIENT_IP);
+        return ESP_ERR_INVALID_ARG;
     }
-    ESP_LOGI(TAG, "stream server up on port %u", port);
+
+    // Pin to Core 0 — camera capture itself runs on Core 1
+    // (CONFIG_CAMERA_CORE1=y), so the sender lives next to WiFi/LWIP.
+    if (xTaskCreatePinnedToCore(stream_task, "video", 4096, NULL, 4, NULL, 0) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "video stream → %s:%u", CLIENT_IP, VIDEO_PORT);
     return ESP_OK;
 }

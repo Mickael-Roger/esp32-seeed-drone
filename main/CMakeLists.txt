@@ -1,9 +1,10 @@
 idf_component_register(
     SRCS
         "main.c"
-        "wifi_sta.c"
+        "wifi_ap.c"
         "udp_push.c"
         "camera_stream.c"
+        "flight_control.c"
     INCLUDE_DIRS "."
     REQUIRES
         driver
@@ -11,9 +12,7 @@ idf_component_register(
         esp_wifi
         esp_event
         esp_netif
-        esp_http_server
         nvs_flash
-        json
         lwip
         icm20948
         espressif__esp32-camera

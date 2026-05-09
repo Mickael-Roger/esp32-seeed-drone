@@ -20,3 +20,26 @@ CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 # port 0). Mixing the legacy and new I2C drivers on the same port hard-aborts.
 CONFIG_SCCB_HARDWARE_I2C_DRIVER_LEGACY=y
 CONFIG_SCCB_HARDWARE_I2C_PORT1=y
+
+# Move the console to the built-in USB-Serial-JTAG peripheral (same /dev/ttyACM0)
+# so GPIO 43 is free for UART1 TX to the flight controller.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# CONFIG_ESP_CONSOLE_UART_DEFAULT is not set
+
+# We run two HTTP servers (control on 80, MJPEG on 81) plus three UDP sockets
+# (orientation push, flight-control listener + heartbeat). The default LWIP
+# pool of 10 is exhausted and httpd starts rejecting new TCP connections with
+# errno 23 (ENFILE).
+CONFIG_LWIP_MAX_SOCKETS=16
+
+# Pin the camera capture task to Core 1. WiFi/LWIP/httpd all live on Core 0;
+# without this, the camera task lands on Core 0 too and frame capture + TCP
+# send compete for the same CPU, dropping MJPEG framerate to ~1 fps.
+CONFIG_CAMERA_CORE1=y
+
+# Send a gratuitous ARP every 2 s. Some APs (notably Freebox) disassociate
+# stations that produce no outbound traffic for a few seconds (reason 4,
+# ASSOC_EXPIRE). Periodic gARP keeps the AP's idle timer happy without
+# requiring app-level traffic.
+CONFIG_LWIP_ESP_GRATUITOUS_ARP=y
+CONFIG_LWIP_GARP_TMR_INTERVAL=2

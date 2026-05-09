@@ -7,7 +7,6 @@ pkgs.mkShell {
       pyside6
       pyopengl
       numpy
-      requests
     ]))
   ];
 }

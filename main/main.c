@@ -3,7 +3,6 @@
 
 #include "driver/i2c.h"
 #include "esp_log.h"
-#include "esp_netif.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -13,8 +12,10 @@
 #include "icm20948_i2c.h"
 
 #include "camera_stream.h"
+#include "flight_control.h"
 #include "udp_push.h"
-#include "wifi_sta.h"
+#include "wifi_ap.h"
+#include "wifi_credentials.h"
 
 #define I2C_SDA_GPIO    5
 #define I2C_SCL_GPIO    6
@@ -154,16 +155,15 @@ void app_main(void)
 
     xTaskCreate(fusion_task, "fusion", 8192, &icm, 5, NULL);
 
-    ESP_ERROR_CHECK(wifi_sta_start());
+    ESP_ERROR_CHECK(wifi_ap_start());
     ESP_ERROR_CHECK(udp_push_start());
+    ESP_ERROR_CHECK(flight_control_start());
 
     ESP_ERROR_CHECK(camera_stream_init());
-    ESP_ERROR_CHECK(camera_stream_start_server(81));
+    ESP_ERROR_CHECK(camera_stream_start());
 
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    esp_netif_ip_info_t ip;
-    ESP_ERROR_CHECK(esp_netif_get_ip_info(netif, &ip));
-    printf("Orientation: POST http://" IPSTR "/subscribe  {\"port\":N}\n",
-           IP2STR(&ip.ip));
-    printf("Video:       GET  http://" IPSTR ":81/stream\n", IP2STR(&ip.ip));
+    printf("AP '%s' ready (ESP=%s, client=%s)\n", WIFI_SSID, ESP_IP, CLIENT_IP);
+    printf("Orientation:    UDP  %s -> %s:%u\n", ESP_IP, CLIENT_IP, ORIENTATION_PORT);
+    printf("Video:          UDP  %s -> %s:%u\n", ESP_IP, CLIENT_IP, VIDEO_PORT);
+    printf("Flight control: UDP  %s -> %s:%u\n", CLIENT_IP, ESP_IP, FLIGHT_PORT);
 }

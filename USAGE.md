@@ -3,7 +3,9 @@
 ## ESP32 firmware
 
 ### First-time setup
-1. Copy WiFi credentials template and fill in:
+1. Copy the WiFi credentials template and pick the SSID/PSK for the drone's
+   own access point (the ESP32 is the AP — there's no upstream router).
+   Other fields rarely need changing:
    ```bash
    cp main/wifi_credentials.h.example main/wifi_credentials.h
    $EDITOR main/wifi_credentials.h
@@ -22,10 +24,12 @@ idf.py -p /dev/ttyACM0 flash monitor
 On boot you should see:
 - `ICM-20948 detected`
 - `DMP enabled (Quat9 / 9-axis)`
+- `wifi_ap: AP 'esp32-drone' up on channel 1, ESP=192.168.4.1, client=192.168.4.2`
 - `camera ready (VGA JPEG)`
-- `wifi: got IP …`
-- `Orientation: POST http://<ip>/subscribe  {"port":N}`
-- `Video:       GET  http://<ip>:81/stream`
+- `AP 'esp32-drone' ready (ESP=192.168.4.1, client=192.168.4.2)`
+- `Orientation:    UDP  192.168.4.1 -> 192.168.4.2:9000`
+- `Video:          UDP  192.168.4.1 -> 192.168.4.2:9001`
+- `Flight control: UDP  192.168.4.2 -> 192.168.4.1:7099`
 
 If the WHO_AM_I check loops, see the I²C section in `AGENTS.md` (external 4.7 kΩ pull-ups on SDA/SCL → 3V3).
 
@@ -33,12 +37,18 @@ If the WHO_AM_I check loops, see the I²C section in `AGENTS.md` (external 4.7 k
 
 ## Python viewer
 
+The viewer takes the WiFi interface as its only required argument. It then:
+1. reads SSID/PSK/IPs/ports from `../main/wifi_credentials.h`,
+2. associates the given interface with the drone's AP via `nmcli`,
+3. opens the orientation/flight/video sockets — all destinations are
+   already known from the credentials file, no handshake required.
+
 ### NixOS (preferred)
 
 ```bash
 cd client
 nix-shell
-python imu_viewer.py <esp32-ip>
+python imu_viewer.py <wifi-device>      # e.g. wlp3s0
 ```
 
 `shell.nix` pulls `numpy`, `pyqtgraph`, `pyside6`, `pyopengl`, and `requests` from nixpkgs. Don't use pip on NixOS — wheels expect FHS paths and fail with `libz.so.1: cannot open shared object file`.
@@ -50,15 +60,28 @@ cd client
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python imu_viewer.py <esp32-ip>
+python imu_viewer.py <wifi-device>
 ```
 
 ### Options
-- `--port N` — local UDP port to bind (default `9000`, set to `0` for ephemeral).
+- `--credentials <path>` — alternate `wifi_credentials.h` (default: `../main/wifi_credentials.h`).
+- `--no-connect` — skip the `nmcli` step; assume the device is already on the AP.
 
 ### Keyboard shortcuts (in the viewer window)
-- **T** — tare: capture the current quaternion as the rest pose, so the box appears at identity in that orientation. Use this to compensate for the DMP's mounting-matrix baseline.
+
+Orientation:
+- **T** — tare: capture the current quaternion as the rest pose.
 - **R** — reset tare: revert to raw DMP output.
+
+Flight control (hold-to-move; release returns the axis to neutral):
+- **↑ / ↓** — pitch forward / backward
+- **← / →** — roll left / right
+- **U / D** — throttle up / down
+- **A** — yaw (turn around)
+
+Momentary commands (single-packet pulse):
+- **S** — takeoff (sets the `fast_fly` bit on the next outgoing packet)
+- **E** — emergency stop (sets the `emergency_stop` bit — kills motors)
 
 The script subscribes to the ESP32 (`POST /subscribe`) every 2 s; subscriptions expire after 5 s on the ESP32 side, so a crashed client stops getting packets automatically.
 
@@ -66,20 +89,26 @@ The script subscribes to the ESP32 (`POST /subscribe`) every 2 s; subscriptions 
 
 ## Firewall
 
-The viewer binds UDP/9000 by default; the ESP32 pushes datagrams to it. Most distros block incoming UDP — open the port before running.
+NetworkManager assigns the WiFi device to the drone AP's subnet
+(`192.168.4.0/24`). The viewer binds the orientation port (UDP/9000 by
+default) on that interface to receive quaternions from the ESP. Most
+distros block incoming UDP unless you punch a hole.
+
+The viewer needs **two** UDP ports open: orientation (`9000`) and video (`9001`).
 
 ### Temporary (NixOS, session-only)
 
 ```bash
-sudo iptables -I nixos-fw -p udp --dport 9000 -j ACCEPT
+sudo iptables -I nixos-fw -p udp -m multiport --dports 9000,9001 -j ACCEPT
 # remove afterwards:
-sudo iptables -D nixos-fw -p udp --dport 9000 -j ACCEPT
+sudo iptables -D nixos-fw -p udp -m multiport --dports 9000,9001 -j ACCEPT
 ```
 
-Tighter scope (only allow the ESP32 itself):
+Tighter scope (only accept traffic from the ESP):
 
 ```bash
-sudo iptables -I nixos-fw -p udp -s 192.168.1.161 --dport 9000 -j ACCEPT
+sudo iptables -I nixos-fw -p udp -s 192.168.4.1 \
+    -m multiport --dports 9000,9001 -j ACCEPT
 ```
 
 If your distro doesn't have the `nixos-fw` chain, use `INPUT` instead.
@@ -89,7 +118,7 @@ If your distro doesn't have the `nixos-fw` chain, use `INPUT` instead.
 Add to `/etc/nixos/configuration.nix`:
 
 ```nix
-networking.firewall.allowedUDPPorts = [ 9000 ];
+networking.firewall.allowedUDPPorts = [ 9000 9001 ];
 ```
 
 Then `sudo nixos-rebuild switch`. The temporary iptables rule is no longer needed.
@@ -102,10 +131,12 @@ A few non-obvious choices are load-bearing — if any of them gets reverted, the
 firmware boot-loops, the magnetometer fusion stops, or one of the endpoints
 locks up.
 
-1. **External pull-ups on I²C** (4.7 kΩ from SDA/SCL → 3V3). The XIAO's
-   internal pulls and the ICM-20948 breakout's 10 kΩ alone are too weak under
-   WiFi RF noise — the bus eventually returns `ESP_ERR_INVALID_STATE` and
-   never recovers. With the externals, 400 kHz is rock-solid.
+1. **Strong I²C pull-ups (~2 kΩ effective).** The XIAO's internal pulls and a
+   weak 10 kΩ on the breakout are too high under WiFi RF noise — the bus
+   eventually returns `ESP_ERR_INVALID_STATE` and never recovers. The GY-912
+   board ships with 2.2 kΩ pulls already wired to its 3V3 rail and is fine on
+   its own. Older ICM-20948 breakouts (10 kΩ on board) need 4.7 kΩ externals
+   in parallel.
 
 2. **`icm20948_i2c_master_enable(true)` before the DMP setup** (in
    `main/main.c::imu_setup`). The cybergear lib's
@@ -120,10 +151,10 @@ locks up.
    the chip hard-aborts at boot (`CONFLICT! driver_ng is not allowed to be
    used with this old driver`). Same driver kind, different ports.
 
-4. **Two HTTP servers, on ports 80 and 81.** `/stream` is an MJPEG handler
-   that never returns; if it lives on the same `httpd` as `/subscribe`, the
-   single worker is stuck forever and `POST /subscribe` times out. The
-   firmware boots a second httpd on port 81 just for video — keep it that way.
+4. **No HTTP server.** Everything is UDP — orientation, video, control.
+   Earlier versions had an MJPEG `/stream` handler on its own httpd; that
+   was an infinite loop that monopolised one of LWIP's scarce TCP slots.
+   Going pure-UDP also removes the `esp_http_server` dependency.
 
 5. **PSRAM + 8 MB flash defaults** (sdkconfig.defaults: `CONFIG_SPIRAM=y`,
    `CONFIG_SPIRAM_MODE_OCT=y`, `CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y`). The camera
@@ -135,33 +166,48 @@ locks up.
    `managed_components/espressif__esp32-camera/` (gitignored). Keep
    `dependencies.lock` gitignored too — re-resolve on each clone.
 
+7. **Console moved to USB-Serial-JTAG** (sdkconfig.defaults:
+   `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`). This frees GPIO 43 (XIAO D6)
+   for use as UART1 TX to the flight controller. `/dev/ttyACM0` continues
+   to carry the log stream as before — same wire, different peripheral.
+
 ## API
 
-### `POST /subscribe`
+### Video UDP payload
 
-Request body:
-```json
-{"port": 9000}
-```
+Each fragment is sent to `CLIENT_IP:VIDEO_PORT` with an 8-byte little-endian header followed by up to 1400 bytes of JPEG. The client groups fragments by `frame_id` and emits the JPEG once all `packet_total` fragments have arrived; if a fragment is lost the whole frame is dropped (next one is ~50 ms away).
 
-The ESP32 captures the caller's IP from the TCP connection and registers
-`(ip, port)` for UDP push. Up to 4 subscribers; entries expire 5 s after the
-last refresh, so clients should re-POST every 2 s.
+| Offset | Type     | Field          |
+|--------|----------|----------------|
+| 0      | uint32   | `frame_id` (monotonic) |
+| 4      | uint16   | `packet_idx` (0-based) |
+| 6      | uint16   | `packet_total` |
+| 8      | bytes    | JPEG payload   |
 
-Response: `{"ok": true}` on success.
+### Flight control (UDP port 7099)
 
-### `GET /stream` (on port 81)
+The ESP32 listens on UDP/7099 and forwards each datagram (after stripping the first byte) to UART1 TX (GPIO 43, 19200 8N1) where the original flight controller is wired. Two packet shapes:
 
-MJPEG video stream over chunked HTTP (`Content-Type: multipart/x-mixed-replace; boundary=frame`). Each part is a complete JPEG frame at VGA (640×480) resolution, ~20 fps depending on lighting and WiFi bandwidth. Served on a **separate HTTP server on port 81** so the never-returning streaming handler doesn't block control endpoints on port 80. Open in any MJPEG-capable client (VLC, browser, `ffplay`, the bundled Python viewer):
+**Control frame** — 9 bytes UDP, 8 forwarded to UART:
 
-```bash
-ffplay http://<ip>:81/stream
-```
+| Byte | Meaning |
+|------|---------|
+| 0    | `0x03` framing prefix (stripped) |
+| 1    | `0x66` header |
+| 2    | pitch (0–255, 128 = neutral) |
+| 3    | roll  (0–255, 128 = neutral) |
+| 4    | throttle (0–255) |
+| 5    | yaw   (0–255, 128 = neutral) |
+| 6    | flag bitmap (fast_fly, fast_drop, e-stop, …) |
+| 7    | CRC = `pitch ^ roll ^ throttle ^ yaw ^ flags` |
+| 8    | `0x99` tail |
 
-### UDP push payload
+**Heartbeat** — the ESP32 replies with `48 01 00 00 00` every 50 ms once a client has been seen, addressed to the latest sender. The client uses this as a link-alive signal.
 
-16 bytes, little-endian, sent to each active subscriber whenever the DMP
-produces a new Quat9 frame:
+### Orientation UDP payload
+
+16 bytes, little-endian, pushed to `CLIENT_IP:ORIENTATION_PORT` (default
+`192.168.4.2:9000`) whenever the DMP produces a new Quat9 frame:
 
 | Offset | Type     | Field |
 |--------|----------|-------|
