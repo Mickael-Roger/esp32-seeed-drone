@@ -9,6 +9,7 @@ The ESP32 runs as a WiFi access point. This script:
     python imu_viewer.py <wifi-device>
 """
 import argparse
+import colorsys
 import math
 import os
 import re
@@ -22,6 +23,15 @@ import time
 import numpy as np
 import pyqtgraph.opengl as gl
 from PySide6 import QtCore, QtGui, QtWidgets
+
+# Object detection (optional). If ultralytics isn't installed or the model
+# can't be loaded (e.g. offline first-run, you're already on the drone AP),
+# the viewer falls back to plain video without bounding boxes.
+try:
+    from ultralytics import YOLO
+    _HAS_YOLO = True
+except Exception:
+    _HAS_YOLO = False
 
 
 PACKET_SIZE = 16           # 4 × float32, little-endian
@@ -215,6 +225,83 @@ def _combine_meshes(*parts):
     return np.vstack(vs), np.vstack(fs), np.vstack(cs)
 
 
+class Detector(QtCore.QObject):
+    """Runs YOLOv8n on the latest video frame in a background thread.
+
+    The video pipeline calls `submit(qimg)` on every frame. The worker only
+    ever processes the most recent submission — older queued frames are
+    dropped, so inference latency never bottlenecks display latency. A list
+    of detections is emitted whenever inference completes.
+    """
+
+    detections = QtCore.Signal(list)  # list of (x, y, w, h, score, cls_id, cls_name)
+
+    def __init__(self, model_name="yolov8n.pt", min_conf=0.30):
+        super().__init__()
+        self._model = YOLO(model_name)
+        self._min_conf = min_conf
+        self._latest = None
+        self._cv = threading.Condition()
+        self._stop = threading.Event()
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
+        with self._cv:
+            self._cv.notify()
+
+    def submit(self, qimg):
+        with self._cv:
+            self._latest = qimg
+            self._cv.notify()
+
+    @staticmethod
+    def _qimg_to_rgb(qimg):
+        img = qimg.convertToFormat(QtGui.QImage.Format_RGB888)
+        ptr = img.constBits()
+        return np.frombuffer(ptr, dtype=np.uint8).reshape(
+            (img.height(), img.width(), 3)
+        ).copy()  # ultralytics may keep a reference; copy to detach Qt's buffer
+
+    def _loop(self):
+        while not self._stop.is_set():
+            with self._cv:
+                while self._latest is None and not self._stop.is_set():
+                    self._cv.wait()
+                if self._stop.is_set():
+                    return
+                qimg = self._latest
+                self._latest = None
+
+            try:
+                arr = self._qimg_to_rgb(qimg)
+                results = self._model(arr, verbose=False, imgsz=640,
+                                      conf=self._min_conf)
+            except Exception as e:
+                print(f"detector error: {e}", file=sys.stderr)
+                continue
+
+            dets = []
+            for box in results[0].boxes:
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                score = float(box.conf[0])
+                cls_id = int(box.cls[0])
+                cls_name = self._model.names.get(cls_id, str(cls_id))
+                dets.append((int(x1), int(y1),
+                             int(x2 - x1), int(y2 - y1),
+                             score, cls_id, cls_name))
+            self.detections.emit(dets)
+
+
+def color_for_class(cls_id):
+    """Stable distinct colour per class, via golden-angle hue stepping."""
+    hue = ((cls_id * 137.5) % 360) / 360.0
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.75, 0.95)
+    return QtGui.QColor(int(r * 255), int(g * 255), int(b * 255))
+
+
 class FlightController:
     """Sends control packets to the ESP32 at 20 Hz.
 
@@ -228,7 +315,11 @@ class FlightController:
     # Bit positions in the FC `flags` byte (matches the legacy protocol).
     FLAG_FAST_FLY        = 0x01  # bit 0 — used here as "takeoff"
     FLAG_EMERGENCY_STOP  = 0x04  # bit 2 — kill motors (drone falls)
-    FLAG_GYRO_CORR       = 0x40  # bit 6 — re-zero the FC's gyro to current pose
+
+    # Trim controls (Shift+Arrow). Each press shifts the pitch/roll baseline
+    # by TRIM_STEP, clamped to ±TRIM_MAX. Used to cancel constant drift.
+    TRIM_STEP = 5
+    TRIM_MAX  = 60
 
     def __init__(self, esp_ip, port):
         self._addr = (esp_ip, port)
@@ -236,6 +327,8 @@ class FlightController:
         self._pressed = set()
         self._pulse_flags = 0
         self._auto_descend = False
+        self._pitch_trim = 0
+        self._roll_trim  = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
 
@@ -265,15 +358,24 @@ class FlightController:
         with self._lock:
             self._pulse_flags |= self.FLAG_EMERGENCY_STOP
 
-    def stabilize(self):
-        """Reset to a known-good state: neutralise all axes, cancel the
-        auto-descend latch, and tell the FC to re-zero its gyro using the
-        current pose. Safe to use mid-flight as a "panic, hands off" button —
-        the drone will drift, then the FC's own stabilisation takes over."""
+    def adjust_trim(self, axis, delta):
+        """Shift the pitch/roll baseline by `delta` (clamped to ±TRIM_MAX)."""
         with self._lock:
-            self._pressed.clear()
-            self._auto_descend = False
-            self._pulse_flags |= self.FLAG_GYRO_CORR
+            if axis == "pitch":
+                self._pitch_trim = max(-self.TRIM_MAX,
+                                       min(self.TRIM_MAX, self._pitch_trim + delta))
+            elif axis == "roll":
+                self._roll_trim  = max(-self.TRIM_MAX,
+                                       min(self.TRIM_MAX, self._roll_trim + delta))
+
+    def reset_trims(self):
+        with self._lock:
+            self._pitch_trim = 0
+            self._roll_trim  = 0
+
+    def trims(self):
+        with self._lock:
+            return self._pitch_trim, self._roll_trim
 
     def toggle_auto_descend(self):
         """Toggle a continuous 'down throttle' that doesn't need a key held."""
@@ -288,6 +390,8 @@ class FlightController:
         with self._lock:
             pressed = set(self._pressed)
             auto_descend = self._auto_descend
+            pitch_trim = self._pitch_trim
+            roll_trim  = self._roll_trim
         pitch = roll = throttle = yaw = FC_NEUTRAL
         if "forward" in pressed: pitch    = FC_FULL_HIGH
         if "back"    in pressed: pitch    = FC_FULL_LOW
@@ -297,6 +401,11 @@ class FlightController:
         elif "down"  in pressed or auto_descend:
                                  throttle = FC_FULL_LOW
         if "turn"    in pressed: yaw      = FC_FULL_HIGH
+        # Apply trims to the pitch/roll signal (clamped to byte range). At
+        # neutral the trim is the only thing biasing the value; at full
+        # deflection it's clamped away.
+        pitch = max(1, min(255, pitch + pitch_trim))
+        roll  = max(1, min(255, roll  + roll_trim))
         return pitch, roll, throttle, yaw
 
     def _build_packet(self):
@@ -421,7 +530,7 @@ class OrientationReceiver(QtCore.QObject):
 
 class Viewer(QtWidgets.QMainWindow):
 
-    INSET_SIZE = 280
+    INSET_SIZE = 140
     INSET_MARGIN = 16
 
     KEY_AXIS = {
@@ -437,7 +546,7 @@ class Viewer(QtWidgets.QMainWindow):
     @staticmethod
     def _keymap_legend():
         return ("↑↓ pitch   ←→ roll   U/D throttle   A yaw   "
-                "T takeoff   S stabilize   L auto-descend   E e-stop")
+                "Shift+arrows trim   T takeoff   L auto-descend   E e-stop")
 
     def _maybe_auto_tare(self):
         """Tare to the current orientation once both video and IMU are flowing."""
@@ -490,6 +599,20 @@ class Viewer(QtWidgets.QMainWindow):
         self._video_rx.frame.connect(self._on_video_frame)
         self._video_rx.start()
         print(f"video: listening on UDP port {cfg['VIDEO_PORT']}")
+
+        self._detector = None
+        if _HAS_YOLO:
+            try:
+                self._detector = Detector()
+                self._detector.detections.connect(self._on_detections)
+                self._detector.start()
+                print("detector: YOLOv8n ready (COCO 80-class)")
+            except Exception as e:
+                print(f"detector disabled: {e}", file=sys.stderr)
+        else:
+            print("detector disabled: install `ultralytics` to enable",
+                  file=sys.stderr)
+        self._latest_dets = []
 
         self._fc = FlightController(cfg["ESP_IP"], int(cfg["FLIGHT_PORT"]))
         self._fc.start()
@@ -571,9 +694,19 @@ class Viewer(QtWidgets.QMainWindow):
 
     @QtCore.Slot(QtGui.QImage)
     def _on_video_frame(self, img):
-        # Camera is mounted upside-down on the drone — flip vertically.
-        self._last_video_pixmap = QtGui.QPixmap.fromImage(img.mirrored(False, True))
+        # Camera is mounted upside-down on the drone — flip vertically. The
+        # detector also runs on the flipped frame so its bounding-box
+        # coordinates match what we draw on screen.
+        flipped = img.mirrored(False, True)
+        if self._detector is not None:
+            self._detector.submit(flipped)
+
+        pixmap = QtGui.QPixmap.fromImage(flipped)
+        if self._latest_dets:
+            self._draw_detections(pixmap, self._latest_dets)
+        self._last_video_pixmap = pixmap
         self._refresh_video_pixmap()
+
         if not self._video_received:
             self._video_received = True
             self._maybe_auto_tare()
@@ -583,6 +716,32 @@ class Viewer(QtWidgets.QMainWindow):
             self._video_fps = self._video_frames / (now - self._last_video_t)
             self._video_frames = 0
             self._last_video_t = now
+
+    @staticmethod
+    def _draw_detections(pixmap, dets):
+        painter = QtGui.QPainter(pixmap)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        font = painter.font()
+        font.setPointSize(10)
+        font.setBold(True)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        for x, y, w, h, score, cls_id, cls_name in dets:
+            color = color_for_class(cls_id)
+            painter.setPen(QtGui.QPen(color, 2))
+            painter.drawRect(x, y, w, h)
+            label = f"{cls_name} {score:.2f}"
+            tw = fm.horizontalAdvance(label) + 6
+            th = fm.height()
+            label_y = max(y, th + 2)
+            painter.fillRect(x, label_y - th, tw, th, color)
+            painter.setPen(QtGui.QColor(0, 0, 0))
+            painter.drawText(x + 3, label_y - 4, label)
+        painter.end()
+
+    @QtCore.Slot(list)
+    def _on_detections(self, dets):
+        self._latest_dets = dets
 
     @QtCore.Slot(float, float, float, float)
     def _on_quat(self, w, x, y, z):
@@ -601,13 +760,24 @@ class Viewer(QtWidgets.QMainWindow):
         if now - self._last_t >= 1.0:
             fps = self._frames / (now - self._last_t)
             tare = "tared" if self._tare is not None else "raw"
+            pt, rt = self._fc.trims()
             self._stats.setText(
-                f"imu {fps:.0f} Hz [{tare}]   video {self._video_fps:.0f} fps"
+                f"imu {fps:.0f} Hz [{tare}]   video {self._video_fps:.0f} fps   "
+                f"trim P={pt:+d} R={rt:+d}"
             )
             self._frames = 0
             self._last_t = now
 
     def keyPressEvent(self, ev):
+        # Shift + arrow → trim adjustment (one step per press, no auto-repeat).
+        if ev.modifiers() & QtCore.Qt.ShiftModifier and not ev.isAutoRepeat():
+            step = self._fc.TRIM_STEP
+            k = ev.key()
+            if   k == QtCore.Qt.Key_Up:    self._fc.adjust_trim("pitch", +step); return
+            elif k == QtCore.Qt.Key_Down:  self._fc.adjust_trim("pitch", -step); return
+            elif k == QtCore.Qt.Key_Right: self._fc.adjust_trim("roll",  +step); return
+            elif k == QtCore.Qt.Key_Left:  self._fc.adjust_trim("roll",  -step); return
+
         axis = self.KEY_AXIS.get(ev.key())
         if axis is not None:
             if not ev.isAutoRepeat():
@@ -624,8 +794,6 @@ class Viewer(QtWidgets.QMainWindow):
             # whatever orientation the drone is sitting in right now.
             self._tare = self._last_quat
             self._fc.takeoff()
-        elif k == QtCore.Qt.Key_S:
-            self._fc.stabilize()
         elif k == QtCore.Qt.Key_L:
             self._fc.toggle_auto_descend()
         elif k == QtCore.Qt.Key_E:
@@ -645,6 +813,8 @@ class Viewer(QtWidgets.QMainWindow):
         self._rx.stop()
         self._video_rx.stop()
         self._fc.stop()
+        if self._detector is not None:
+            self._detector.stop()
         super().closeEvent(ev)
 
 

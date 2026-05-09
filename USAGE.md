@@ -79,14 +79,17 @@ Momentary commands (single-packet pulse):
 - **T** — takeoff. Re-tares the 3D orientation reference to the current
   pose **before** sending the takeoff packet, so the on-screen drone
   matches the physical "ready to fly" attitude.
-- **S** — stabilize. Snaps every control axis back to neutral, cancels
-  the auto-descend latch, and sets the `gyro_corr` bit on the next
-  packet so the FC re-zeros its gyro reference. Useful as a "panic,
-  hands off" button: stop fighting the FC, let its own stabilisation
-  take over. **Don't press during heavy maneuvering on the ground —
-  the gyro recalibration will lock in whatever pose the drone has at
-  that instant as "level".**
 - **E** — emergency stop (sets the `emergency_stop` bit — kills motors).
+
+Trim (drift correction):
+- **Shift + ↑ / ↓** — adjust pitch trim (forward / backward bias)
+- **Shift + ← / →** — adjust roll trim (left / right bias)
+
+Each press shifts the corresponding axis baseline by 5 (clamped to ±60).
+The trim is added to whatever you're commanding, so it acts as a constant
+offset that compensates for the drone's natural drift. Current values are
+shown in the bottom-right stats panel as `trim P=+5 R=-3`. Use them when
+the drone slowly drifts in one direction even with no keys pressed.
 
 Latched commands (toggle on/off):
 - **L** — auto-descend: keeps the throttle pinned low without holding **D**.
@@ -97,6 +100,27 @@ Tare is also applied **automatically** the moment the viewer first sees
 both the video stream and the IMU stream — so the rest pose is captured
 when the drone is sitting still on the ground at startup. Pressing **T**
 just refreshes that reference at takeoff time.
+
+### Object detection overlay
+
+If `ultralytics` is installed (`pip install ultralytics`, or in `shell.nix`
+on NixOS), the viewer runs YOLOv8n on every video frame in a background
+thread and overlays bounding boxes for the **80 COCO classes** — people,
+animals, vehicles, common objects. Each class gets a stable colour (golden-
+angle hue stepping) and a confidence label.
+
+**First-run note**: ultralytics auto-downloads `yolov8n.pt` (~6 MB) to
+`~/.cache/ultralytics/` the first time. **Do this while you still have
+internet** — once you're associated with the drone AP, you're offline and
+the download will fail. Pre-warm with:
+
+```bash
+python3 -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+```
+
+If the model can't be loaded, the viewer just shows plain video — no
+crash. Look for `detector: YOLOv8n ready` (success) or
+`detector disabled: …` (fallback) in the startup output.
 
 The script subscribes to the ESP32 (`POST /subscribe`) every 2 s; subscriptions expire after 5 s on the ESP32 side, so a crashed client stops getting packets automatically.
 

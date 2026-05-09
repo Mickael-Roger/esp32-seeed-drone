@@ -20,3 +20,5 @@ client/.venv/
 client/venv/
 client/result
 client/result-*
+client/*.pt
+client/models/
