@@ -228,6 +228,7 @@ class FlightController:
     # Bit positions in the FC `flags` byte (matches the legacy protocol).
     FLAG_FAST_FLY        = 0x01  # bit 0 — used here as "takeoff"
     FLAG_EMERGENCY_STOP  = 0x04  # bit 2 — kill motors (drone falls)
+    FLAG_GYRO_CORR       = 0x40  # bit 6 — re-zero the FC's gyro to current pose
 
     def __init__(self, esp_ip, port):
         self._addr = (esp_ip, port)
@@ -263,6 +264,16 @@ class FlightController:
         """Kill motors immediately (drone drops)."""
         with self._lock:
             self._pulse_flags |= self.FLAG_EMERGENCY_STOP
+
+    def stabilize(self):
+        """Reset to a known-good state: neutralise all axes, cancel the
+        auto-descend latch, and tell the FC to re-zero its gyro using the
+        current pose. Safe to use mid-flight as a "panic, hands off" button —
+        the drone will drift, then the FC's own stabilisation takes over."""
+        with self._lock:
+            self._pressed.clear()
+            self._auto_descend = False
+            self._pulse_flags |= self.FLAG_GYRO_CORR
 
     def toggle_auto_descend(self):
         """Toggle a continuous 'down throttle' that doesn't need a key held."""
@@ -426,7 +437,14 @@ class Viewer(QtWidgets.QMainWindow):
     @staticmethod
     def _keymap_legend():
         return ("↑↓ pitch   ←→ roll   U/D throttle   A yaw   "
-                "S takeoff   L auto-descend   E e-stop   T tare   R reset")
+                "T takeoff   S stabilize   L auto-descend   E e-stop")
+
+    def _maybe_auto_tare(self):
+        """Tare to the current orientation once both video and IMU are flowing."""
+        if (self._tare is None
+                and self._video_received and self._quat_received):
+            self._tare = self._last_quat
+            print("auto-tared (video + IMU streams ready)")
 
     def __init__(self, cfg):
         super().__init__()
@@ -482,6 +500,8 @@ class Viewer(QtWidgets.QMainWindow):
         self._last_t = time.monotonic()
         self._last_quat = (1.0, 0.0, 0.0, 0.0)
         self._tare = None
+        self._video_received = False
+        self._quat_received = False
         self._last_video_pixmap = None
         self._video_frames = 0
         self._last_video_t = time.monotonic()
@@ -554,6 +574,9 @@ class Viewer(QtWidgets.QMainWindow):
         # Camera is mounted upside-down on the drone — flip vertically.
         self._last_video_pixmap = QtGui.QPixmap.fromImage(img.mirrored(False, True))
         self._refresh_video_pixmap()
+        if not self._video_received:
+            self._video_received = True
+            self._maybe_auto_tare()
         self._video_frames += 1
         now = time.monotonic()
         if now - self._last_video_t >= 1.0:
@@ -564,6 +587,9 @@ class Viewer(QtWidgets.QMainWindow):
     @QtCore.Slot(float, float, float, float)
     def _on_quat(self, w, x, y, z):
         self._last_quat = (w, x, y, z)
+        if not self._quat_received:
+            self._quat_received = True
+            self._maybe_auto_tare()
         if self._tare is not None:
             dw, dx, dy, dz = quat_mul(quat_inv(self._tare), (w, x, y, z))
         else:
@@ -593,12 +619,19 @@ class Viewer(QtWidgets.QMainWindow):
         if ev.isAutoRepeat():
             return
         k = ev.key()
-        if   k == QtCore.Qt.Key_S: self._fc.takeoff()
-        elif k == QtCore.Qt.Key_L: self._fc.toggle_auto_descend()
-        elif k == QtCore.Qt.Key_E: self._fc.emergency_stop()
-        elif k == QtCore.Qt.Key_T: self._tare = self._last_quat
-        elif k == QtCore.Qt.Key_R: self._tare = None
-        else: super().keyPressEvent(ev)
+        if k == QtCore.Qt.Key_T:
+            # Re-tare immediately before takeoff so the rest pose reflects
+            # whatever orientation the drone is sitting in right now.
+            self._tare = self._last_quat
+            self._fc.takeoff()
+        elif k == QtCore.Qt.Key_S:
+            self._fc.stabilize()
+        elif k == QtCore.Qt.Key_L:
+            self._fc.toggle_auto_descend()
+        elif k == QtCore.Qt.Key_E:
+            self._fc.emergency_stop()
+        else:
+            super().keyPressEvent(ev)
 
     def keyReleaseEvent(self, ev):
         axis = self.KEY_AXIS.get(ev.key())

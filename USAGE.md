@@ -69,10 +69,6 @@ python imu_viewer.py <wifi-device>
 
 ### Keyboard shortcuts (in the viewer window)
 
-Orientation:
-- **T** — tare: capture the current quaternion as the rest pose.
-- **R** — reset tare: revert to raw DMP output.
-
 Flight control (hold-to-move; release returns the axis to neutral):
 - **↑ / ↓** — pitch forward / backward
 - **← / →** — roll left / right
@@ -80,13 +76,27 @@ Flight control (hold-to-move; release returns the axis to neutral):
 - **A** — yaw (turn around)
 
 Momentary commands (single-packet pulse):
-- **S** — takeoff (sets the `fast_fly` bit on the next outgoing packet)
-- **E** — emergency stop (sets the `emergency_stop` bit — kills motors)
+- **T** — takeoff. Re-tares the 3D orientation reference to the current
+  pose **before** sending the takeoff packet, so the on-screen drone
+  matches the physical "ready to fly" attitude.
+- **S** — stabilize. Snaps every control axis back to neutral, cancels
+  the auto-descend latch, and sets the `gyro_corr` bit on the next
+  packet so the FC re-zeros its gyro reference. Useful as a "panic,
+  hands off" button: stop fighting the FC, let its own stabilisation
+  take over. **Don't press during heavy maneuvering on the ground —
+  the gyro recalibration will lock in whatever pose the drone has at
+  that instant as "level".**
+- **E** — emergency stop (sets the `emergency_stop` bit — kills motors).
 
 Latched commands (toggle on/off):
 - **L** — auto-descend: keeps the throttle pinned low without holding **D**.
   Press again to stop, or press **U** / **D** to take manual control (which
   cancels the latch).
+
+Tare is also applied **automatically** the moment the viewer first sees
+both the video stream and the IMU stream — so the rest pose is captured
+when the drone is sitting still on the ground at startup. Pressing **T**
+just refreshes that reference at takeoff time.
 
 The script subscribes to the ESP32 (`POST /subscribe`) every 2 s; subscriptions expire after 5 s on the ESP32 side, so a crashed client stops getting packets automatically.
 
